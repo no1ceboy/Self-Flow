@@ -4,6 +4,31 @@ import os
 import json
 
 
+def _parse_csv_ints(value):
+    if value in [None, '']:
+        return []
+    if isinstance(value, list):
+        return value
+    steps = []
+    for item in value.split(','):
+        item = item.strip().lower()
+        if not item:
+            continue
+        if item.endswith('k'):
+            steps.append(int(float(item[:-1]) * 1000))
+        else:
+            steps.append(int(item))
+    return steps
+
+
+def _parse_csv_strings(value):
+    if value in [None, '']:
+        return []
+    if isinstance(value, list):
+        return value
+    return [item.strip().lower() for item in value.split(',') if item.strip()]
+
+
 def parse_and_load_from_model(parser):
     # args according to the loaded model
     # do not try to specify them from cmd line since they will be overwritten
@@ -60,6 +85,12 @@ def apply_rules(args):
             raise ValueError('--layersync_weak_layer must be smaller than --layersync_strong_layer.')
         if hasattr(args, 'layers') and args.layersync_strong_layer > args.layers:
             raise ValueError('--layersync_strong_layer must be <= --layers.')
+    if hasattr(args, 'eval_steps'):
+        args.eval_steps = _parse_csv_ints(args.eval_steps)
+        if any(step <= 0 for step in args.eval_steps):
+            raise ValueError('--eval_steps must contain positive training steps.')
+    if hasattr(args, 'eval_metrics'):
+        args.eval_metrics = _parse_csv_strings(args.eval_metrics)
     return args
 
 
@@ -177,6 +208,14 @@ def add_training_options(parser):
                        help="Number of repetitions for evaluation loop during training.")
     group.add_argument("--eval_num_samples", default=1_000, type=int,
                        help="If -1, will use all samples in the specified split.")
+    group.add_argument("--eval_steps", default="", type=str,
+                       help="Comma-separated exact training steps to run validation, e.g. 50000,100000,200000.")
+    group.add_argument("--eval_metrics", default="all", type=str,
+                       help=(
+                           "Comma-separated validation metrics. For MDM, supported metrics are fid and precision "
+                           "(HumanML/KIT precision maps to R_precision). Image metrics sfid, inception_score, "
+                           "and recall are accepted but skipped because MDM has no native implementation."
+                       ))
     group.add_argument("--log_interval", default=1_000, type=int,
                        help="Log losses each N steps")
     group.add_argument("--save_interval", default=50_000, type=int,

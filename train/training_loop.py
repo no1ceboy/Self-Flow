@@ -54,6 +54,7 @@ class TrainLoop:
         self.lr = args.lr
         self.log_interval = args.log_interval
         self.save_interval = args.save_interval
+        self.eval_steps = set(args.eval_steps)
         self.resume_checkpoint = args.resume_checkpoint
         self.use_fp16 = False  # deprecating this option
         self.fp16_scale_growth = 1e-3  # deprecating this option
@@ -227,13 +228,20 @@ class TrainLoop:
                         else:
                             self.train_platform.report_scalar(name=k, value=v, iteration=self.total_step(), group_name='Loss')
 
-                if self.total_step() % self.save_interval == 0:
-                    self.save()
+                should_save = self.total_step() % self.save_interval == 0
+                should_eval = self.args.eval_during_training and (
+                    should_save or self.total_step() in self.eval_steps
+                )
+                if should_save or should_eval:
                     self.model.eval()
                     if self.args.use_ema:
                         self.model_avg.eval()
-                    self.evaluate()
-                    self.generate_during_training()
+                    if should_save:
+                        self.save()
+                    if should_eval:
+                        self.evaluate()
+                    if should_save:
+                        self.generate_during_training()
                     self.model.train()
                     if self.args.use_ema:
                         self.model_avg.train()
@@ -260,7 +268,8 @@ class TrainLoop:
             mm_num_times = 0  # mm is super slow hence we won't run it during training
             eval_dict = eval_humanml.evaluation(
                 self.eval_wrapper, self.eval_gt_data, self.eval_data, log_file,
-                replication_times=self.args.eval_rep_times, diversity_times=diversity_times, mm_num_times=mm_num_times, run_mm=False)
+                replication_times=self.args.eval_rep_times, diversity_times=diversity_times,
+                mm_num_times=mm_num_times, run_mm=False, metric_names=self.args.eval_metrics)
             print(eval_dict)
             for k, v in eval_dict.items():
                 if k.startswith('R_precision'):
