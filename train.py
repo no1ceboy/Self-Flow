@@ -393,7 +393,10 @@ def build_model_config(model_size):
         compatibility_mode=True,
         class_dropout_prob=DEFAULT_CFG_DROPOUT_RATE,
         layersync_project_weak=False,
-        layersync_proj_dim=2048,
+        layersync_projector_kind="residual_mlp",
+        layersync_proj_dim=384,
+        layersync_projector_depth=None,
+        layersync_projector_dropout=0.0,
         layersync_capture_layers=None,
     )
 
@@ -458,7 +461,10 @@ def create_train_state(rng, config, learning_rate, grad_clip=1.0):
         compatibility_mode=config["compatibility_mode"],
         class_dropout_prob=config["class_dropout_prob"],
         layersync_project_weak=config.get("layersync_project_weak", False),
-        layersync_proj_dim=config.get("layersync_proj_dim", 2048),
+        layersync_projector_kind=config.get("layersync_projector_kind", "residual_mlp"),
+        layersync_proj_dim=config.get("layersync_proj_dim", 384),
+        layersync_projector_depth=config.get("layersync_projector_depth"),
+        layersync_projector_dropout=config.get("layersync_projector_dropout", 0.0),
         per_token=False,
     )
 
@@ -1246,8 +1252,30 @@ def main():
     parser.add_argument(
         "--layersync-proj-dim",
         type=int,
-        default=2048,
-        help="Hidden width of the 3-layer MLP projector applied to the weak LayerSync feature.",
+        default=384,
+        help="Hidden width of the weak-feature LayerSync projector.",
+    )
+    parser.add_argument(
+        "--layersync-projector-kind",
+        type=str,
+        default="residual_mlp",
+        choices=("residual_mlp", "deep_mlp", "convnext"),
+        help="Projector architecture for weak LayerSync features.",
+    )
+    parser.add_argument(
+        "--layersync-projector-depth",
+        type=int,
+        default=None,
+        help=(
+            "Projector depth. Defaults by kind: residual_mlp=4 linear layers, "
+            "deep_mlp=3 residual blocks, convnext=1 token-mixing block."
+        ),
+    )
+    parser.add_argument(
+        "--layersync-projector-dropout",
+        type=float,
+        default=0.0,
+        help="Optional projector dropout. Default 0.0.",
     )
     # ── VAE model (must match the variant used in prepare_data_tpu.py) ──────
     parser.add_argument(
@@ -1399,6 +1427,10 @@ def main():
         raise ValueError("--layersync-lambda must be non-negative")
     if args.layersync_proj_dim <= 0:
         raise ValueError("--layersync-proj-dim must be positive")
+    if args.layersync_projector_depth is not None and args.layersync_projector_depth <= 0:
+        raise ValueError("--layersync-projector-depth must be positive")
+    if not 0.0 <= args.layersync_projector_dropout < 1.0:
+        raise ValueError("--layersync-projector-dropout must be in [0.0, 1.0)")
     if not 0.0 <= args.cfg_dropout_rate < 1.0:
         raise ValueError("--cfg-dropout-rate must be in [0.0, 1.0)")
     if args.cfg_dropout_rate <= 0.0 and (args.sample_cfg_scale > 1.0 or args.fid_cfg_scale > 1.0):
@@ -1443,12 +1475,16 @@ def main():
         weak_layer, strong_layer = resolve_layersync_config(args, config["depth"])
         layersync_capture_layers = (weak_layer, strong_layer)
         config["layersync_project_weak"] = True
+        config["layersync_projector_kind"] = args.layersync_projector_kind
         config["layersync_proj_dim"] = int(args.layersync_proj_dim)
+        config["layersync_projector_depth"] = args.layersync_projector_depth
+        config["layersync_projector_dropout"] = float(args.layersync_projector_dropout)
         config["layersync_capture_layers"] = layersync_capture_layers
         log_stage(
             f"LayerSync ENABLED: lambda={args.layersync_lambda} "
             f"weak_layer={weak_layer} strong_layer={strong_layer} "
-            f"weak_projector=mlp3x hidden={args.layersync_proj_dim}"
+            f"weak_projector={args.layersync_projector_kind} "
+            f"hidden={args.layersync_proj_dim} depth={args.layersync_projector_depth or 'default'}"
         )
     else:
         log_stage("LayerSync DISABLED: lambda=0.0")

@@ -14,6 +14,8 @@ import jax.numpy as jnp
 import flax.linen as nn
 from einops import rearrange
 
+from src.projectors import build_projector
+
 XAVIER_UNIFORM = nn.initializers.xavier_uniform()
 ZERO_INIT = nn.initializers.zeros
 NORMAL_002 = nn.initializers.normal(stddev=0.02)
@@ -272,21 +274,6 @@ class FinalLayer(nn.Module):
         return x
 
 
-class LayerSyncProjector(nn.Module):
-    """3-layer MLP projector for aligning weak-layer states to strong-layer states."""
-    hidden_dim: int = 2048
-    output_dim: int = 768
-
-    @nn.compact
-    def __call__(self, x):
-        x = nn.Dense(self.hidden_dim)(x)
-        x = nn.silu(x)
-        x = nn.Dense(self.hidden_dim)(x)
-        x = nn.silu(x)
-        x = nn.Dense(self.output_dim)(x)
-        return x
-
-
 class SelfFlowDiT(nn.Module):
     """Base Self-Flow DiT model."""
     input_size: int = 32
@@ -302,7 +289,10 @@ class SelfFlowDiT(nn.Module):
     per_token: bool = False
     class_dropout_prob: float = 0.1
     layersync_project_weak: bool = False
-    layersync_proj_dim: int = 2048
+    layersync_projector_kind: str = "residual_mlp"
+    layersync_proj_dim: int = 384
+    layersync_projector_depth: int | None = None
+    layersync_projector_dropout: float = 0.0
 
     def setup(self):
         self.out_channels_val = self.in_channels * 2 if self.learn_sigma else self.in_channels
@@ -312,9 +302,13 @@ class SelfFlowDiT(nn.Module):
         pos_embed = get_2d_sincos_pos_embed(self.hidden_size, self.grid_size)
         self.pos_embed_val = pos_embed[None, ...] # (1, num_patches, hidden_size)
         if self.layersync_project_weak:
-            self.layersync_projector = LayerSyncProjector(
-                hidden_dim=self.layersync_proj_dim,
+            self.layersync_projector = build_projector(
+                kind=self.layersync_projector_kind,
+                input_dim=self.hidden_size,
                 output_dim=self.hidden_size,
+                hidden_dim=self.layersync_proj_dim,
+                depth=self.layersync_projector_depth,
+                dropout_rate=self.layersync_projector_dropout,
             )
 
     @nn.compact
@@ -443,7 +437,7 @@ class SelfFlowDiT(nn.Module):
                 weak_layer, strong_layer = layersync_layers
                 if (i + 1) == weak_layer:
                     if self.layersync_project_weak:
-                        layersync_weak_z = self.layersync_projector(x)
+                        layersync_weak_z = self.layersync_projector(x, train=not deterministic)
                     else:
                         layersync_weak_z = x
                 elif (i + 1) == strong_layer:
