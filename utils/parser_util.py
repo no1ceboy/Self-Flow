@@ -51,6 +51,15 @@ def apply_rules(args):
     # For target conditioning
     if args.lambda_target_loc > 0.:
         args.multi_target_cond = True
+    if hasattr(args, 'lambda_layersync'):
+        if args.lambda_layersync < 0.:
+            raise ValueError('--lambda_layersync must be non-negative.')
+        if args.layersync_weak_layer <= 0 or args.layersync_strong_layer <= 0:
+            raise ValueError('--layersync_weak_layer and --layersync_strong_layer must be positive.')
+        if args.layersync_weak_layer >= args.layersync_strong_layer:
+            raise ValueError('--layersync_weak_layer must be smaller than --layersync_strong_layer.')
+        if hasattr(args, 'layers') and args.layersync_strong_layer > args.layers:
+            raise ValueError('--layersync_strong_layer must be <= --layers.')
     return args
 
 
@@ -113,6 +122,12 @@ def add_model_options(parser):
     group.add_argument("--lambda_vel", default=0.0, type=float, help="Joint velocity loss.")
     group.add_argument("--lambda_fc", default=0.0, type=float, help="Foot contact loss.")
     group.add_argument("--lambda_target_loc", default=0.0, type=float, help="For HumanML only, when . L2 with target location.")
+    group.add_argument("--lambda_layersync", default=0.0, type=float,
+                       help="Weight for direct LayerSync cosine alignment between intermediate transformer layers.")
+    group.add_argument("--layersync_weak_layer", default=3, type=int,
+                       help="1-based shallow transformer layer used by LayerSync.")
+    group.add_argument("--layersync_strong_layer", default=6, type=int,
+                       help="1-based deeper transformer layer used by LayerSync.")
     group.add_argument("--unconstrained", action='store_true',
                        help="Model is trained unconditionally. That is, it is constrained by neither text nor action. "
                             "Currently tested on HumanAct12 only.")

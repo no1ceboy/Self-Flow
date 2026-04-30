@@ -186,12 +186,14 @@ class MDM(nn.Module):
         mask = ~mask  # mask: True means no token there, we invert since the meaning of mask for transformer is inverted  https://pytorch.org/docs/stable/generated/torch.nn.MultiheadAttention.html
         return enc_text, mask
 
-    def forward(self, x, timesteps, y=None):
+    def forward(self, x, timesteps, y=None, return_layersync_features=None):
         """
         x: [batch_size, njoints, nfeats, max_frames], denoted x_t in the paper
         timesteps: [batch_size] (int)
         """
         bs, njoints, nfeats, nframes = x.shape
+        layersync_layers = self._validate_layersync_layers(return_layersync_features)
+        layersync_features = None
         time_emb = self.embed_timestep(timesteps)  # [1, bs, d]
 
         if 'target_cond' in y.keys():
@@ -250,7 +252,16 @@ class MDM(nn.Module):
             # adding the timestep embed
             xseq = torch.cat((emb, x), axis=0)  # [seqlen+1, bs, d]
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
-            output = self.seqTransEncoder(xseq, src_key_padding_mask=frames_mask)[1:]  # , src_key_padding_mask=~maskseq)  # [seqlen, bs, d]
+            if layersync_layers is None:
+                output = self.seqTransEncoder(xseq, src_key_padding_mask=frames_mask)[1:]  # , src_key_padding_mask=~maskseq)  # [seqlen, bs, d]
+            else:
+                output, layersync_features = self._forward_encoder_layersync(
+                    xseq,
+                    src_key_padding_mask=frames_mask,
+                    layersync_layers=layersync_layers,
+                )
+                output = output[1:]
+                layersync_features = tuple(feature[1:] for feature in layersync_features)
 
         elif self.arch == 'trans_dec':
             if self.emb_trans_dec:
@@ -260,16 +271,37 @@ class MDM(nn.Module):
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen+1, bs, d]
 
             if self.text_encoder_type == 'clip':
-                output = self.seqTransDecoder(tgt=xseq, memory=emb, tgt_key_padding_mask=frames_mask)
+                if layersync_layers is None:
+                    output = self.seqTransDecoder(tgt=xseq, memory=emb, tgt_key_padding_mask=frames_mask)
+                else:
+                    output, layersync_features = self._forward_decoder_layersync(
+                        xseq,
+                        memory=emb,
+                        tgt_key_padding_mask=frames_mask,
+                        layersync_layers=layersync_layers,
+                    )
             elif self.text_encoder_type == 'bert':
-                output = self.seqTransDecoder(tgt=xseq, memory=emb, memory_key_padding_mask=text_mask, tgt_key_padding_mask=frames_mask)  # Rotem's bug fix
+                if layersync_layers is None:
+                    output = self.seqTransDecoder(tgt=xseq, memory=emb, memory_key_padding_mask=text_mask, tgt_key_padding_mask=frames_mask)  # Rotem's bug fix
+                else:
+                    output, layersync_features = self._forward_decoder_layersync(
+                        xseq,
+                        memory=emb,
+                        memory_key_padding_mask=text_mask,
+                        tgt_key_padding_mask=frames_mask,
+                        layersync_layers=layersync_layers,
+                    )
             else:
                 raise ValueError()
 
             if self.emb_trans_dec:
                 output = output[1:] # [seqlen, bs, d]
+                if layersync_features is not None:
+                    layersync_features = tuple(feature[1:] for feature in layersync_features)
 
         elif self.arch == 'gru':
+            if layersync_layers is not None:
+                raise ValueError('LayerSync is only supported for transformer MDM architectures.')
             xseq = x
             xseq = self.sequence_pos_encoder(xseq)  # [seqlen, bs, d]
             output, _ = self.gru(xseq)
@@ -277,10 +309,65 @@ class MDM(nn.Module):
         # Extract completed suffix
         if self.is_prefix_comp:
             output = output[self.context_len:]
+            if layersync_features is not None:
+                layersync_features = tuple(feature[self.context_len:] for feature in layersync_features)
             y['mask'] = y['mask'][..., self.context_len:]
         
         output = self.output_process(output)  # [bs, njoints, nfeats, nframes]
+        if layersync_features is not None:
+            layersync_features = tuple(feature.permute(1, 0, 2).contiguous() for feature in layersync_features)
+            return output, layersync_features
         return output
+
+    def _validate_layersync_layers(self, layers):
+        if layers is None:
+            return None
+        if len(layers) != 2:
+            raise ValueError(f'LayerSync expects exactly two layers, got {layers}')
+        weak_layer, strong_layer = (int(layers[0]), int(layers[1]))
+        if not (1 <= weak_layer <= self.num_layers and 1 <= strong_layer <= self.num_layers):
+            raise ValueError(
+                f'LayerSync layers must be in [1, {self.num_layers}], got {(weak_layer, strong_layer)}'
+            )
+        if weak_layer >= strong_layer:
+            raise ValueError(
+                f'LayerSync weak layer must be smaller than strong layer, got {(weak_layer, strong_layer)}'
+            )
+        return weak_layer, strong_layer
+
+    def _forward_encoder_layersync(self, xseq, src_key_padding_mask, layersync_layers):
+        hidden = xseq
+        captured = {}
+        for layer_idx, layer in enumerate(self.seqTransEncoder.layers, start=1):
+            hidden = layer(hidden, src_key_padding_mask=src_key_padding_mask)
+            if layer_idx in layersync_layers:
+                captured[layer_idx] = hidden
+        if self.seqTransEncoder.norm is not None:
+            hidden = self.seqTransEncoder.norm(hidden)
+        return hidden, tuple(captured[layer_idx] for layer_idx in layersync_layers)
+
+    def _forward_decoder_layersync(
+        self,
+        xseq,
+        memory,
+        layersync_layers,
+        memory_key_padding_mask=None,
+        tgt_key_padding_mask=None,
+    ):
+        hidden = xseq
+        captured = {}
+        for layer_idx, layer in enumerate(self.seqTransDecoder.layers, start=1):
+            hidden = layer(
+                hidden,
+                memory,
+                memory_key_padding_mask=memory_key_padding_mask,
+                tgt_key_padding_mask=tgt_key_padding_mask,
+            )
+            if layer_idx in layersync_layers:
+                captured[layer_idx] = hidden
+        if self.seqTransDecoder.norm is not None:
+            hidden = self.seqTransDecoder.norm(hidden)
+        return hidden, tuple(captured[layer_idx] for layer_idx in layersync_layers)
 
 
     def _apply(self, fn):

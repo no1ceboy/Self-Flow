@@ -137,6 +137,9 @@ class GaussianDiffusion:
         lambda_vel_rcxyz=0.,
         lambda_fc=0.,
         lambda_target_loc=0.,
+        lambda_layersync=0.,
+        layersync_weak_layer=3,
+        layersync_strong_layer=6,
         **kargs,
     ):
         self.model_mean_type = model_mean_type
@@ -157,9 +160,12 @@ class GaussianDiffusion:
         self.lambda_root_vel = lambda_root_vel
         self.lambda_vel_rcxyz = lambda_vel_rcxyz
         self.lambda_fc = lambda_fc
+        self.lambda_layersync = lambda_layersync
+        self.layersync_layers = (int(layersync_weak_layer), int(layersync_strong_layer))
 
         if self.lambda_rcxyz > 0. or self.lambda_vel > 0. or self.lambda_root_vel > 0. or \
-                self.lambda_vel_rcxyz > 0. or self.lambda_fc > 0. or self.lambda_target_loc > 0.:
+                self.lambda_vel_rcxyz > 0. or self.lambda_fc > 0. or self.lambda_target_loc > 0. or \
+                self.lambda_layersync > 0.:
             assert self.loss_type == LossType.MSE, 'Geometric losses are supported by MSE loss type only!'
 
         # Use float64 for accuracy.
@@ -203,6 +209,25 @@ class GaussianDiffusion:
 
         # self.l2_loss = lambda a, b: (a - b) ** 2  # th.nn.MSELoss(reduction='none')  # must be None for handling mask later on.
         self.masked_l2 = masked_l2
+
+    def layersync_loss(self, raw_features, mask=None):
+        weak, strong = raw_features
+        strong = strong.detach()
+        weak = th.nn.functional.normalize(weak.float(), dim=-1, eps=1e-8)
+        strong = th.nn.functional.normalize(strong.float(), dim=-1, eps=1e-8)
+        cosine = (weak * strong).sum(dim=-1)
+
+        if mask is not None:
+            token_mask = mask.squeeze(1).squeeze(1).float()
+            if token_mask.shape[-1] != cosine.shape[-1]:
+                token_mask = token_mask[..., -cosine.shape[-1]:]
+            token_mask = token_mask.to(device=cosine.device, dtype=cosine.dtype)
+            denom = token_mask.sum(dim=-1).clamp_min(1.0)
+            mean_cosine = (cosine * token_mask).sum(dim=-1) / denom
+        else:
+            mean_cosine = cosine.mean(dim=-1)
+
+        return -mean_cosine, mean_cosine
 
 
 
@@ -1264,7 +1289,19 @@ class GaussianDiffusion:
             if self.loss_type == LossType.RESCALED_KL:
                 terms["loss"] *= self.num_timesteps
         elif self.loss_type == LossType.MSE or self.loss_type == LossType.RESCALED_MSE:
-            model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
+            if self.lambda_layersync > 0.:
+                model_output, layersync_features = model(
+                    x_t,
+                    self._scale_timesteps(t),
+                    return_layersync_features=self.layersync_layers,
+                    **model_kwargs,
+                )
+                terms["layersync"], terms["layersync_cosine"] = self.layersync_loss(
+                    layersync_features,
+                    model_kwargs['y'].get('mask'),
+                )
+            else:
+                model_output = model(x_t, self._scale_timesteps(t), **model_kwargs)
 
             if self.model_var_type in [
                 ModelVarType.LEARNED,
@@ -1351,7 +1388,8 @@ class GaussianDiffusion:
                             (self.lambda_vel * terms.get('vel_mse', 0.)) +\
                             (self.lambda_rcxyz * terms.get('rcxyz_mse', 0.)) + \
                             (self.lambda_target_loc * terms.get('target_loc', 0.)) + \
-                            (self.lambda_fc * terms.get('fc', 0.))
+                            (self.lambda_fc * terms.get('fc', 0.)) + \
+                            (self.lambda_layersync * terms.get('layersync', 0.))
 
         else:
             raise NotImplementedError(self.loss_type)
