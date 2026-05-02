@@ -54,8 +54,8 @@ class ResidualBottleneckMLP(ProjectorBase):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = True) -> jnp.ndarray:
-        if self.depth < 4 or self.depth > 6:
-            raise ValueError(f"ResidualBottleneckMLP depth must be in [4, 6], got {self.depth}")
+        if self.depth < 2 or self.depth > 8:
+            raise ValueError(f"ResidualBottleneckMLP depth must be in [2, 8], got {self.depth}")
 
         residual = _project_residual(x, self.output_dim)
         y = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=True)(x)
