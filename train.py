@@ -1259,7 +1259,7 @@ def main():
         "--layersync-projector-kind",
         type=str,
         default="residual_mlp",
-        choices=("residual_mlp", "deep_mlp", "convnext"),
+        choices=("residual_mlp", "deep_mlp", "convnext", "spatial_cnn"),
         help="Projector architecture for weak LayerSync features.",
     )
     parser.add_argument(
@@ -1268,7 +1268,7 @@ def main():
         default=None,
         help=(
             "Projector depth. Defaults by kind: residual_mlp=4 linear layers, "
-            "deep_mlp=3 residual blocks, convnext=1 token-mixing block."
+            "deep_mlp=3 residual blocks, convnext=1 token-mixing block, spatial_cnn=2 spatial blocks."
         ),
     )
     parser.add_argument(

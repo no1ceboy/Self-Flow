@@ -17,6 +17,7 @@ __all__ = [
     "ResidualBottleneckMLP",
     "DeepResidualMLP",
     "MiniConvNeXtProjector",
+    "SpatialCNNProjector",
     "build_projector",
     "count_parameters",
 ]
@@ -54,8 +55,8 @@ class ResidualBottleneckMLP(ProjectorBase):
 
     @nn.compact
     def __call__(self, x: jnp.ndarray, train: bool = True) -> jnp.ndarray:
-        if self.depth < 2 or self.depth > 8:
-            raise ValueError(f"ResidualBottleneckMLP depth must be in [2, 8], got {self.depth}")
+        if self.depth < 2 or self.depth > 16:
+            raise ValueError(f"ResidualBottleneckMLP depth must be in [2, 16], got {self.depth}")
 
         residual = _project_residual(x, self.output_dim)
         y = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=True)(x)
@@ -125,6 +126,91 @@ class DeepResidualMLP(ProjectorBase):
                 dropout_rate=self.dropout_rate,
             )(y, train=train)
         return y
+
+
+class _SpatialCNNBlock(nn.Module):
+    output_dim: int
+    hidden_dim: int
+    kernel_size: int
+    activation: str
+    dropout_rate: float
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool = True) -> jnp.ndarray:
+        residual = _project_residual(x, self.output_dim)
+        y = nn.LayerNorm(epsilon=1e-6, use_bias=False, use_scale=True)(x)
+        y = nn.Dense(
+            self.hidden_dim,
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+        )(y)
+        y = nn.Conv(
+            features=self.hidden_dim,
+            kernel_size=(self.kernel_size, self.kernel_size),
+            padding="SAME",
+            kernel_init=XAVIER_UNIFORM,
+            bias_init=ZERO_INIT,
+        )(y)
+        y = _activation(y, self.activation)
+        if self.dropout_rate > 0.0:
+            y = nn.Dropout(rate=self.dropout_rate)(y, deterministic=not train)
+        y = nn.Dense(
+            self.output_dim,
+            kernel_init=RESIDUAL_BRANCH_INIT,
+            bias_init=ZERO_INIT,
+        )(y)
+        return residual + y
+
+
+class SpatialCNNProjector(ProjectorBase):
+    """2D spatial CNN projector for [B, T, C] sequence features (requires square spatial grid)."""
+
+    output_dim: int
+    hidden_dim: int = 384
+    depth: int = 2
+    kernel_size: int = 3
+    activation: str = "silu"
+    dropout_rate: float = 0.0
+
+    @nn.compact
+    def __call__(self, x: jnp.ndarray, train: bool = True) -> jnp.ndarray:
+        if x.ndim == 2:
+            return ResidualBottleneckMLP(
+                output_dim=self.output_dim,
+                hidden_dim=self.hidden_dim,
+                depth=4,
+                activation=self.activation,
+                dropout_rate=self.dropout_rate,
+            )(x, train=train)
+        if x.ndim != 3:
+            raise ValueError(f"SpatialCNNProjector expects rank 2 or 3 input, got rank {x.ndim}")
+        if self.depth < 1 or self.depth > 8:
+            raise ValueError(f"SpatialCNNProjector depth must be in [1, 8], got {self.depth}")
+
+        import math
+        from einops import rearrange
+
+        B, T, C = x.shape
+        H = int(math.sqrt(T))
+        if H * H != T:
+            raise ValueError(f"SpatialCNNProjector requires a square spatial sequence length, got {T}")
+
+        # Reshape to 2D grid: (B, H, W, C)
+        grid = rearrange(x, 'b (h w) c -> b h w c', h=H, w=H)
+
+        y = grid
+        for _ in range(self.depth):
+            y = _SpatialCNNBlock(
+                output_dim=self.output_dim,
+                hidden_dim=self.hidden_dim,
+                kernel_size=self.kernel_size,
+                activation=self.activation,
+                dropout_rate=self.dropout_rate,
+            )(y, train=train)
+
+        # Reshape back to 1D sequence
+        out = rearrange(y, 'b h w c -> b (h w) c')
+        return out
 
 
 class _ConvNeXtTokenBlock(nn.Module):
@@ -223,11 +309,11 @@ def build_projector(
     """Build a LayerSync projector module.
 
     Args:
-        kind: One of "residual_mlp", "deep_mlp", or "convnext".
+        kind: One of "residual_mlp", "deep_mlp", "convnext", or "spatial_cnn".
         input_dim: Used as the default output dimension.
         output_dim: Target embedding size. Defaults to input_dim.
         hidden_dim: Internal bottleneck width.
-        depth: Per-kind depth. Defaults: 4, 3, and 1 respectively.
+        depth: Per-kind depth. Defaults: 4, 3, 1, and 2 respectively.
     """
     output_dim = input_dim if output_dim is None else output_dim
     kind = kind.lower()
@@ -257,7 +343,16 @@ def build_projector(
             activation=activation,
             dropout_rate=dropout_rate,
         )
+    if kind == "spatial_cnn":
+        return SpatialCNNProjector(
+            output_dim=output_dim,
+            hidden_dim=hidden_dim,
+            depth=2 if depth is None else depth,
+            kernel_size=kernel_size,
+            activation=activation,
+            dropout_rate=dropout_rate,
+        )
     raise ValueError(
         f"Unsupported projector kind '{kind}'. "
-        "Expected one of: residual_mlp, deep_mlp, convnext."
+        "Expected one of: residual_mlp, deep_mlp, convnext, spatial_cnn."
     )
