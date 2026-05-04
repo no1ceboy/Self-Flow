@@ -148,6 +148,7 @@ class _SpatialCNNBlock(nn.Module):
             features=self.hidden_dim,
             kernel_size=(self.kernel_size, self.kernel_size),
             padding="SAME",
+            feature_group_count=self.hidden_dim,
             kernel_init=XAVIER_UNIFORM,
             bias_init=ZERO_INIT,
         )(y)
